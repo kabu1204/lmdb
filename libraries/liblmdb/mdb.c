@@ -241,6 +241,7 @@ union semun {
 
 #include "lmdb.h"
 #include "midl.h"
+#include "internal.h"
 
 #if (BYTE_ORDER == LITTLE_ENDIAN) == (BYTE_ORDER == BIG_ENDIAN)
 # error "Unknown or unsupported endianness (BYTE_ORDER)"
@@ -579,7 +580,7 @@ typedef MDB_ID	txnid_t;
 #endif
 
 #if MDB_DEBUG
-static int mdb_debug;
+static int mdb_debug = 1;
 static txnid_t mdb_debug_start;
 
 	/**	Print a debug message with printf formatting.
@@ -1511,8 +1512,8 @@ struct MDB_env {
 	unsigned int	me_maxreaders;	/**< size of the reader table */
 	/** Max #MDB_txninfo.%mti_numreaders of interest to #mdb_env_close() */
 	volatile int	me_close_readers;
-	MDB_dbi		me_numdbs;		/**< number of DBs opened */
-	MDB_dbi		me_maxdbs;		/**< size of the DB table */
+	MDB_dbi		me_numdbs;		/**< number of DBs opened (default 2) */
+	MDB_dbi		me_maxdbs;		/**< size of the DB table (default 2) */
 	MDB_PID_T	me_pid;		/**< process ID of this env */
 	char		*me_path;		/**< path to the DB files */
 	char		*me_map;		/**< the memory map of the data file */
@@ -3035,7 +3036,7 @@ mdb_txn_renew0(MDB_txn *txn)
 			MDB_reader *r = (env->me_flags & MDB_NOTLS) ? txn->mt_u.reader :
 				pthread_getspecific(env->me_txkey);
 			if (r) {
-				if (r->mr_pid != env->me_pid || r->mr_txnid != (txnid_t)-1)
+				if (r->mr_pid != env->me_pid || r->mr_txnid != (txnid_t)-1) // TODO: ?
 					return MDB_BAD_RSLOT;
 			} else {
 				MDB_PID_T pid = env->me_pid;
@@ -3043,6 +3044,7 @@ mdb_txn_renew0(MDB_txn *txn)
 				mdb_mutexref_t rmutex = env->me_rmutex;
 
 				if (!env->me_live_reader) {
+                    // TODO: ?
 					rc = mdb_reader_pid(env, Pidset, pid);
 					if (rc)
 						return rc;
@@ -4176,7 +4178,7 @@ mdb_env_read_header(MDB_env *env, int prev, MDB_meta *meta)
 	/* We don't know the page size yet, so use a minimum value.
 	 * Read both meta pages so we can use the latest one.
 	 */
-
+    DPRINTF(("PAGEHDRSZ: %d\n", PAGEHDRSZ));
 	for (i=off=0; i<NUM_METAS; i++, off += meta->mm_psize) {
 #ifdef _WIN32
 		DWORD len;
@@ -4216,9 +4218,12 @@ mdb_env_read_header(MDB_env *env, int prev, MDB_meta *meta)
 			return MDB_VERSION_MISMATCH;
 		}
 
-		if (off == 0 || (prev ? m->mm_txnid < meta->mm_txnid : m->mm_txnid > meta->mm_txnid))
-			*meta = *m;
+		if (off == 0 || (prev ? m->mm_txnid < meta->mm_txnid : m->mm_txnid > meta->mm_txnid)) {
+            *meta = *m;
+            printf("meta->mm_psize: %d\n", meta->mm_psize);
+        }
 	}
+    DPUTS("read header success");
 	return 0;
 }
 
@@ -4457,7 +4462,15 @@ mdb_env_create(MDB_env **env)
 	GET_PAGESIZE(e->me_os_psize);
 	VGMEMP_CREATE(e,0,0);
 	*env = e;
+    mdb_env_print(e);
 	return MDB_SUCCESS;
+}
+
+void mdb_env_print(MDB_env *e) {
+    printf("------MDB ENV------\n");
+    printf("me_pid: \t%d\n", e->me_pid);
+    printf("me_os_psize: \t%d\n", e->me_os_psize);
+    printf("-------------------\n");
 }
 
 #ifdef _WIN32
@@ -4827,6 +4840,7 @@ mdb_fopen(const MDB_env *env, MDB_name *fname,
 	}
 	fd = CreateFileW(fname->mn_val, acc, share, NULL, disp, attrs, NULL);
 #else
+    DPRINTF(("open %s", fname->mn_val));
 	fd = open(fname->mn_val, which & MDB_O_MASK, mode);
 #endif
 
@@ -4953,11 +4967,11 @@ mdb_env_open2(MDB_env *env, int prev)
 			return i;
 		DPUTS("new mdbenv");
 		newenv = 1;
-		env->me_psize = env->me_os_psize;
+		env->me_psize = env->me_os_psize;   // db page size = os page size
 		if (env->me_psize > MAX_PAGESIZE)
 			env->me_psize = MAX_PAGESIZE;
 		memset(&meta, 0, sizeof(meta));
-		mdb_env_init_meta0(env, &meta);
+		mdb_env_init_meta0(env, &meta); // init meta page
 		meta.mm_mapsize = DEFAULT_MAPSIZE;
 	} else {
 		env->me_psize = meta.mm_psize;
@@ -5003,6 +5017,7 @@ mdb_env_open2(MDB_env *env, int prev)
 	}
 #endif
 
+    /* create .mdb mmap */
 	rc = mdb_env_map(env, (flags & MDB_FIXEDMAP) ? meta.mm_address : NULL);
 	if (rc)
 		return rc;
@@ -5038,6 +5053,8 @@ mdb_env_open2(MDB_env *env, int prev)
 		DPRINTF(("leaf pages: %"Yu,     db->md_leaf_pages));
 		DPRINTF(("overflow pages: %"Yu, db->md_overflow_pages));
 		DPRINTF(("root: %"Yu,           db->md_root));
+        DPRINTF(("maxfree 1page: %"Yu,  env->me_maxfree_1pg));
+        DPRINTF(("nodemax 1page: %"Yu, env->me_nodemax));
 	}
 #endif
 
@@ -5597,6 +5614,7 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 		/* silently ignore WRITEMAP when we're only getting read access */
 		flags &= ~MDB_WRITEMAP;
 	} else {
+        // allocate free list and dirty list.
 		if (!((env->me_free_pgs = mdb_midl_alloc(MDB_IDL_UM_MAX)) &&
 			  (env->me_dirty_list = calloc(MDB_IDL_UM_SIZE, sizeof(MDB_ID2)))))
 			rc = ENOMEM;
@@ -5662,6 +5680,8 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 		 */
 		if (!(flags & (MDB_RDONLY|MDB_WRITEMAP))) {
 			rc = mdb_fopen(env, &fname, MDB_O_META, mode, &env->me_mfd);
+            // TODO
+            DPRINTF(("me_fd: %d, me_mfd: %d", env->me_fd, env->me_mfd));
 			if (rc)
 				goto leave;
 		}

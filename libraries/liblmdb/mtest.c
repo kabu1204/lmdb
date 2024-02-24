@@ -38,6 +38,7 @@ int main(int argc,char * argv[])
 	srand(time(NULL));
 
 	    count = (rand()%384) + 64;
+        count = 1;
 	    values = (int *)malloc(count*sizeof(int));
 
 	    for(i = 0;i<count;i++) {
